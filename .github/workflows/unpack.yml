@@ -54,7 +54,6 @@ jobs:
     timeout-minutes: 2
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      small:  ${{ steps.plan.outputs.small }}
     steps:
       - uses: actions/checkout@v4
       - name: Split bins into groups
@@ -102,7 +101,7 @@ jobs:
       - name: Download this group's files
         env:
           FILES: ${{ matrix.urls }}
-          SMALLS: ${{ needs.plan.outputs.small }}
+          SMALLS: ${{ matrix.smalls }}
           SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}   # optional: cookie/token for your DL source
         run: |
           mkdir repack repack/MD5
