@@ -1,0 +1,164 @@
+name: unpack
+
+# Directions, verified live against GoFile's 2026 API:
+#   INPUT  : direct file URLs pasted below (GoFile only *serves* these to
+#            premium accounts, so GoFile cannot be the CI input source).
+#   OUTPUT : uploading to GoFile needs no account at all — CI mints a guest
+#            token per run and each part gets its own public downloadPage link.
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_list:
+        description: >-
+          Repack files, one per line: <name>|<url> or just <url>
+          (setup.exe + every fg-*.bin + MD5 manifest files). Use your original
+          download-source direct links.
+        required: true
+      groups:
+        description: "number of parallel bin groups (jobs)"
+        required: false
+        default: "2"
+      zip_split_gb:
+        description: "split each group's zip into parts of this many GB (0 = one zip)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+env:
+  ENGINE_RELEASE: "https://github.com/pisek/fitgirl-extractor/releases/download/v0.2.1/fitgirl-extractor.exe"
+  ENGINE_SHA256: "d4dbe676ee1b9eb23b9dc416ec69654da717c59aa89cb125557b11af59d98054"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Wine (WoW64) + tools
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wine wine32 wine64 p7zip-full curl jq
+      - name: Engine sanity (no game content needed)
+        run: |
+          curl -fsSL "$ENGINE_RELEASE" -o fitgirl-extractor.exe
+          echo "$ENGINE_SHA256  fitgirl-extractor.exe" | sha256sum -c
+          chmod +x fitgirl-extractor.exe
+          WINEDEBUG=-all wine fitgirl-extractor.exe --version
+
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      small:  ${{ steps.plan.outputs.small }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Split bins into groups
+        id: plan
+        env:
+          GROUPS: ${{ inputs.groups }}
+          FILE_LIST: ${{ inputs.file_list }}
+        run: |
+          printf '%s\n' "$FILE_LIST" | scripts/plan_bins.py
+
+  unpack:
+    needs: [smoke, plan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355           # stay just under the 6h job cap
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      # ~85GB free instead of ~20GB: extract happens on local SSD, sizes ~ one group's bins
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wine wine32 wine64 p7zip-full curl jq
+
+      - name: Fetch engine
+        run: |
+          curl -fsSL "$ENGINE_RELEASE" -o fitgirl-extractor.exe
+          echo "$ENGINE_SHA256  fitgirl-extractor.exe" | sha256sum -c
+          chmod +x fitgirl-extractor.exe
+
+      - name: Download this group's files
+        env:
+          FILES: ${{ matrix.urls }}
+          SMALLS: ${{ needs.plan.outputs.small }}
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}   # optional: cookie/token for your DL source
+        run: |
+          mkdir repack repack/MD5
+          {
+            printf '%s\n' "$FILES"   | tr ',' '\n'
+            printf '%s\n' "$SMALLS"  | jq -r '.[] | "\(.name)|\(.url)"'
+          } > allpairs.txt
+          while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            name="${pair%%|*}"; url="${pair#*|}"
+            echo "downloading $name"
+            mkdir -p "repack/$(dirname "$name")"
+            curl -fL --retry 5 --retry-delay 10 -C - -o "repack/$name" "$url" || \
+              curl -fL --retry 5 --retry-delay 10 -C - -o "repack/$name" "$url?token=$SOURCE_TOKEN"
+          done < allpairs.txt
+          # engine wants MD5 manifests under MD5/
+          if ls repack/*.md5 >/dev/null 2>&1; then mv repack/*.md5 repack/MD5/; fi
+          ls -lhR repack
+
+      - name: Extract (native innoextract + Wine codecs)
+        env:
+          FILES: ${{ matrix.urls }}
+        run: |
+          mapfile -t ONLY < <(printf '%s\n' "$FILES" | tr ',' '\n' | sed '/^$/d' | sed 's/|.*$//')
+          ONLY_ARGS=()
+          for name in "${ONLY[@]}"; do
+            [ "$name" = "${name%%|*}" ] || name="${name%%|*}"
+            ONLY_ARGS+=(--only "$name")
+          done
+          WINEPREFIX="$PWD/.wine" WINEDEBUG=-all \
+            wine fitgirl-extractor.exe repack -d out "${ONLY_ARGS[@]}" --verbose 2>&1 | tee extract.log
+          test -d out || { echo "::error::extraction produced no output"; exit 1; }
+          du -sh out
+
+      - name: Pack store-mode zip (fast to re-unpack)
+        run: |
+          SPLIT=""
+          [ "${{ inputs.zip_split_gb }}" != "0" ] && SPLIT="-v${{ inputs.zip_split_gb }}g"
+          7z a -tzip -mx=0 $SPLIT "group-${{ matrix.i }}.zip" out
+          ls -lh group-*.zip*
+
+      - name: Upload result to GoFile (guest OK — no secret needed)
+        id: up
+        run: |
+          LINKS_OUT=""
+          for f in group-${{ matrix.i }}.zip*; do
+            out=$(scripts/gofilectl.sh upload "$f")
+            echo "$out"
+            LINKS_OUT="$LINKS_OUT $out"
+          done
+          echo "links=$LINKS_OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        run: |
+          {
+            echo "### group ${{ matrix.i }} done"
+            echo ""
+            echo "${{ steps.up.outputs.links }}"
+          } >> "$GITHUB_STEP_SUMMARY"
